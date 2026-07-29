@@ -1,0 +1,11 @@
+{
+  "name": "wasm-worker-pool-demo",
+  "private": true,
+  "description": "Bootsharp C# WASM running in a Web Worker thread pool",
+  "scripts": {
+    "start": "serve . -l 8080"
+  },
+  "devDependencies": {
+    "serve": "^14.2.1"
+  }
+}

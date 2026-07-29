@@ -1,0 +1,4 @@
+{
+  "microsoft.net.workload.mono.toolchain.net9": "10.0.109",
+  "microsoft.net.workload.emscripten.net9": "10.0.109"
+}

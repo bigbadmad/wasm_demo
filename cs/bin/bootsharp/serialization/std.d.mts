@@ -1,0 +1,24 @@
+import { Binary } from "./serializer.mjs";
+export declare const std: {
+    Boolean: Binary<boolean>;
+    Byte: Binary<number>;
+    SByte: Binary<number>;
+    Int16: Binary<number>;
+    UInt16: Binary<number>;
+    Int32: Binary<number>;
+    UInt32: Binary<number>;
+    Int64: Binary<bigint>;
+    UInt64: Binary<number>;
+    IntPtr: Binary<number>;
+    Single: Binary<number>;
+    Double: Binary<number>;
+    Decimal: Binary<number>;
+    Char: Binary<string>;
+    String: Binary<string | null | undefined>;
+    DateTime: Binary<Date>;
+    DateTimeOffset: Binary<Date>;
+    Nullable: <T>(inner: Binary<T>) => Binary<T | null | undefined>;
+    Array: <T>(element: Binary<T>) => Binary<ArrayLike<T> | null | undefined>;
+    List: <T>(element: Binary<T>) => Binary<ArrayLike<T> | null | undefined>;
+    Dictionary: <TKey, TValue>(key: Binary<TKey>, value: Binary<TValue>) => Binary<Map<TKey, TValue> | null | undefined>;
+};

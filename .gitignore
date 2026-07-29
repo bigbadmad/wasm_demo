@@ -1,0 +1,12 @@
+# .NET build intermediates — cs/bin/bootsharp/ (the deployable ES module)
+# is intentionally committed so colleagues can run this without the SDK.
+cs/obj/
+cs/bin/Debug/
+cs/*.Backup.tmp
+
+# Local tool/IDE config, not part of the app
+.claude/
+.vs/
+
+# Node
+node_modules/
