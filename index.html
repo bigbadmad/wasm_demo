@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Bootsharp C# WASM — 4-worker thread pool</title>
+<title>Bootsharp C# WASM — worker thread pool</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><text y=%2213%22 font-size=%2214%22>🧵</text></svg>">
 <style>
   :root {
@@ -81,7 +81,7 @@
 
   .workers {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 12px;
   }
   .worker-card {
@@ -149,10 +149,12 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Bootsharp C# WASM — 4-worker thread pool</h1>
+  <h1>Bootsharp C# WASM — worker thread pool</h1>
   <p class="sub">
-    A small JS-side pool manages 4 dedicated Web Workers, each booting its own
-    Bootsharp .NET runtime instance. Jobs beyond 4 concurrent queue up and are
+    A small JS-side pool manages a capped set of dedicated Web Workers, each
+    booting its own Bootsharp .NET runtime instance. Workers are spawned
+    lazily, on demand, as jobs arrive — not all up front — since each one
+    carries a fair amount of memory. Jobs beyond the cap queue up and are
     dispatched the moment a worker frees. Every job is a synchronous
     <code>BusyWait(ms)</code> call inside its worker — the main thread stays
     responsive throughout, as shown by the heartbeat below.
@@ -166,9 +168,12 @@
       <input id="minDur" type="number" value="500" min="0" step="100">
       <label for="maxDur">Max ms</label>
       <input id="maxDur" type="number" value="3000" min="0" step="100">
+      <label for="maxWorkers">Max workers</label>
+      <input id="maxWorkers" type="number" value="4" min="1" max="8">
       <button id="runBtn">Run batch</button>
     </div>
     <div class="stats row">
+      <span id="spawnStat">spawned: 0 / 0</span>
       <span id="queueStat">queued: 0</span>
       <span id="doneStat">completed: 0 / 0</span>
       <span id="wallStat"></span>
@@ -204,11 +209,15 @@ function log(tag, msg) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-const POOL_SIZE = 4;
+const maxWorkersInput = document.getElementById('maxWorkers');
+const spawnStat = document.getElementById('spawnStat');
 const workersEl = document.getElementById('workers');
 const cards = new Map(); // id -> { card, badge, jobInfo, fill }
 
-for (let id = 0; id < POOL_SIZE; id++) {
+function cardFor(id) {
+  let c = cards.get(id);
+  if (c) return c;
+
   const card = document.createElement('div');
   card.className = 'worker-card';
   card.innerHTML = `
@@ -220,18 +229,22 @@ for (let id = 0; id < POOL_SIZE; id++) {
     <div class="bar"><div class="fill"></div></div>
   `;
   workersEl.appendChild(card);
-  cards.set(id, {
+  c = {
     card,
     badge: card.querySelector('.badge'),
     jobInfo: card.querySelector('.job-info'),
     fill: card.querySelector('.fill'),
-  });
+  };
+  cards.set(id, c);
+  spawnStat.textContent = `spawned: ${cards.size} / ${pool.maxWorkers}`;
+  return c;
 }
 
-const pool = new WorkerPool({ size: POOL_SIZE, workerUrl: '/worker.js' });
+const pool = new WorkerPool({ maxWorkers: Number(maxWorkersInput.value) || 4, workerUrl: '/worker.js' });
+spawnStat.textContent = `spawned: 0 / ${pool.maxWorkers}`;
 
 pool.on('statechange', (entry) => {
-  const c = cards.get(entry.id);
+  const c = cardFor(entry.id);
   c.badge.className = `badge state-${entry.state}`;
   c.badge.textContent = entry.state;
   if (entry.state === 'idle') {
@@ -274,6 +287,8 @@ runBtn.addEventListener('click', async () => {
   const jobCount = Math.max(1, Number(document.getElementById('jobCount').value) || 1);
   const minDur = Math.max(0, Number(document.getElementById('minDur').value) || 0);
   const maxDur = Math.max(minDur, Number(document.getElementById('maxDur').value) || minDur);
+  pool.maxWorkers = Math.max(1, Number(maxWorkersInput.value) || 1);
+  spawnStat.textContent = `spawned: ${cards.size} / ${pool.maxWorkers}`;
 
   runBtn.disabled = true;
   const doneStat = document.getElementById('doneStat');
@@ -284,7 +299,7 @@ runBtn.addEventListener('click', async () => {
   const durations = Array.from({ length: jobCount }, () =>
     Math.round(minDur + Math.random() * (maxDur - minDur)));
 
-  log('main', `submitting ${jobCount} jobs to the pool (durations ${minDur}-${maxDur} ms), 4 workers`);
+  log('main', `submitting ${jobCount} jobs to the pool (durations ${minDur}-${maxDur} ms), max ${pool.maxWorkers} workers`);
   const wallStart = performance.now();
   let completed = 0;
 
@@ -304,7 +319,7 @@ runBtn.addEventListener('click', async () => {
   runBtn.disabled = false;
 });
 
-log('main', 'pool ready — 4 workers booting, click "Run batch" once they go idle');
+log('main', `pool ready — no workers spawned yet, click "Run batch" to start (cap: ${pool.maxWorkers})`);
 </script>
 </body>
 </html>

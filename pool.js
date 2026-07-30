@@ -1,17 +1,18 @@
-// Manages a fixed-size pool of module Web Workers as if they were threads.
+// Manages a capped pool of module Web Workers as if they were threads.
 // Each worker boots the Bootsharp .NET runtime once and is reused for many
-// jobs — jobs submitted beyond the pool size queue until a worker frees up.
+// jobs. Workers are spawned lazily, on demand, as jobs arrive — not eagerly
+// at construction — since each one carries a fair amount of memory (its own
+// .NET runtime + business logic library). The pool only ever grows up to
+// maxWorkers; jobs beyond that queue until a worker frees up.
 
 export class WorkerPool {
-    constructor({ size = 4, workerUrl } = {}) {
-        this.size = size;
+    constructor({ maxWorkers = 4, workerUrl } = {}) {
+        this.maxWorkers = maxWorkers;
         this.workerUrl = workerUrl;
-        this.workers = [];      // { id, worker, state, currentJob }
-        this.queue = [];        // pending jobs waiting for a free worker
+        this.workers = [];      // spawned so far: { id, worker, state, currentJob }
+        this.queue = [];        // pending jobs waiting for a free (or new) worker
         this.jobCounter = 0;
         this.listeners = {};
-
-        for (let id = 0; id < size; id++) this._spawn(id);
     }
 
     on(event, cb) {
@@ -32,7 +33,10 @@ export class WorkerPool {
         for (const entry of this.workers) entry.worker.terminate();
     }
 
-    _spawn(id) {
+    // Spawns a new worker at the next free slot (growing the pool), or, if
+    // `id` is given, replaces the worker at that existing slot (used to
+    // recover from an error without changing the pool's size).
+    _spawn(id = this.workers.length) {
         const worker = new Worker(this.workerUrl, { type: 'module' });
         const entry = { id, worker, state: 'booting', currentJob: null };
         this.workers[id] = entry;
@@ -66,7 +70,7 @@ export class WorkerPool {
         entry.worker.terminate();
         this._emit('error', { entry, err });
 
-        // Replace the failed worker so the pool stays at full size.
+        // Replace the failed worker in its same slot so the pool doesn't shrink.
         this._spawn(entry.id);
 
         if (job) job.reject(err instanceof Error ? err : new Error(err?.message || 'worker error'));
@@ -75,7 +79,12 @@ export class WorkerPool {
     _dispatch() {
         if (this.queue.length === 0) return;
         const free = this.workers.find(w => w.state === 'idle');
-        if (!free) return;
+        if (!free) {
+            // No idle worker — grow the pool if we're still under the cap.
+            // The new worker's 'ready' message will trigger dispatch again.
+            if (this.workers.length < this.maxWorkers) this._spawn();
+            return;
+        }
 
         const job = this.queue.shift();
         this._emit('queuechange', this.queue.length);
