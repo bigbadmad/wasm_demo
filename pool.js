@@ -1,15 +1,24 @@
 // Manages a capped pool of module Web Workers as if they were threads.
 // Each worker boots the Bootsharp .NET runtime once and is reused for many
-// jobs. Workers are spawned lazily, on demand, as jobs arrive — not eagerly
-// at construction — since each one carries a fair amount of memory (its own
+// jobs. Workers are spawned lazily, on demand, as jobs arrive - not eagerly
+// at construction - since each one carries a fair amount of memory (its own
 // .NET runtime + business logic library). The pool only ever grows up to
 // maxWorkers; jobs beyond that queue until a worker frees up.
 
 export class WorkerPool {
-    constructor({ maxWorkers = 4, workerUrl } = {}) {
+    // memoryBudgetBytes: soft cap on total self-reported worker memory - a new
+    // worker won't be spawned if it would likely push the pool over this.
+    // workerMemoryLimitBytes: per-worker ceiling - a worker that reports more
+    // than this after finishing a job gets terminated and replaced, since WASM
+    // linear memory can't shrink on its own; recycling is the only way back.
+    // Both default to Infinity (no gating), so omitting them keeps the pool's
+    // prior count-only-cap behavior unchanged.
+    constructor({ maxWorkers = 4, memoryBudgetBytes = Infinity, workerMemoryLimitBytes = Infinity, workerUrl } = {}) {
         this.maxWorkers = maxWorkers;
+        this.memoryBudgetBytes = memoryBudgetBytes;
+        this.workerMemoryLimitBytes = workerMemoryLimitBytes;
         this.workerUrl = workerUrl;
-        this.workers = [];      // spawned so far: { id, worker, state, currentJob }
+        this.workers = [];      // spawned so far: { id, worker, state, currentJob, memBytes }
         this.queue = [];        // pending jobs waiting for a free (or new) worker
         this.jobCounter = 0;
         this.listeners = {};
@@ -38,7 +47,7 @@ export class WorkerPool {
     // recover from an error without changing the pool's size).
     _spawn(id = this.workers.length) {
         const worker = new Worker(this.workerUrl, { type: 'module' });
-        const entry = { id, worker, state: 'booting', currentJob: null };
+        const entry = { id, worker, state: 'booting', currentJob: null, memBytes: 0 };
         this.workers[id] = entry;
 
         worker.onmessage = ({ data }) => this._handleMessage(entry, data);
@@ -50,16 +59,28 @@ export class WorkerPool {
     _handleMessage(entry, data) {
         if (data.type === 'ready') {
             entry.state = 'idle';
+            entry.memBytes = data.memBytes ?? entry.memBytes;
             this._emit('statechange', entry);
             this._dispatch();
 
         } else if (data.type === 'done') {
             const job = entry.currentJob;
             entry.currentJob = null;
-            entry.state = 'idle';
+            entry.memBytes = data.memBytes ?? entry.memBytes;
             this._emit('jobdone', { entry, job, text: data.text, elapsed: data.elapsed });
             job.resolve({ text: data.text, elapsed: data.elapsed });
-            this._emit('statechange', entry);
+
+            if (entry.memBytes > this.workerMemoryLimitBytes) {
+                // Over budget - WASM memory only grows, so the only way to
+                // reclaim it is to terminate this worker and boot a fresh one
+                // in its place, rather than returning it to the idle pool.
+                this._emit('recycle', { entry, memBytes: entry.memBytes });
+                entry.worker.terminate();
+                this._spawn(entry.id);
+            } else {
+                entry.state = 'idle';
+                this._emit('statechange', entry);
+            }
             this._dispatch();
         }
     }
@@ -76,25 +97,55 @@ export class WorkerPool {
         if (job) job.reject(err instanceof Error ? err : new Error(err?.message || 'worker error'));
     }
 
+    // Assigning to idle workers and growing the pool are separate concerns,
+    // both re-checked on every call: assign first, then - if backlog remains
+    // - consider spawning one more. Keeping growth conditional on "no idle
+    // worker was found" (instead of "is there still backlog") would let a
+    // single steadily-busy worker starve growth forever, since it re-absorbs
+    // the next queued job before the pool ever gets a chance to reconsider
+    // spawning a second one.
     _dispatch() {
-        if (this.queue.length === 0) return;
-        const free = this.workers.find(w => w.state === 'idle');
-        if (!free) {
-            // No idle worker — grow the pool if we're still under the cap.
-            // The new worker's 'ready' message will trigger dispatch again.
-            if (this.workers.length < this.maxWorkers) this._spawn();
-            return;
+        while (this.queue.length > 0) {
+            const free = this.workers.find(w => w.state === 'idle');
+            if (!free) break;
+
+            const job = this.queue.shift();
+            this._emit('queuechange', this.queue.length);
+
+            free.state = 'busy';
+            free.currentJob = job;
+            this._emit('jobstart', { entry: free, job });
+            this._emit('statechange', free);
+
+            free.worker.postMessage({ duration: job.duration });
         }
 
-        const job = this.queue.shift();
-        this._emit('queuechange', this.queue.length);
+        // Backlog remains after using every idle worker. Workers still
+        // booting are future capacity already accounted for - each will
+        // claim one queued job the moment it's ready - so only spawn beyond
+        // that if the backlog is deeper than what's already in flight, and
+        // we're still under the count cap, and a new worker is unlikely to
+        // blow the memory budget. The new worker's 'ready' message re-enters
+        // here, same as every booting worker's does.
+        const booting = this.workers.filter(w => w.state === 'booting').length;
+        if (this.queue.length > booting && this.workers.length < this.maxWorkers && this._withinMemoryBudget()) {
+            this._spawn();
+        }
+    }
 
-        free.state = 'busy';
-        free.currentJob = job;
-        this._emit('jobstart', { entry: free, job });
-        this._emit('statechange', free);
+    _withinMemoryBudget() {
+        if (this.memoryBudgetBytes === Infinity) return true;
+        if (this.workers.length === 0) return true; // no data yet - let the first worker through
 
-        free.worker.postMessage({ duration: job.duration });
+        // Don't compound uncertainty: wait for every existing worker to
+        // report real usage before betting on whether one more will fit.
+        // Otherwise a burst of submissions before any worker has booted
+        // would spawn past the budget on nothing but guesses.
+        if (this.workers.some(w => w.memBytes === 0)) return false;
+
+        const total = this.workers.reduce((sum, w) => sum + w.memBytes, 0);
+        const estimate = total / this.workers.length;
+        return total + estimate <= this.memoryBudgetBytes;
     }
 
     _emit(event, payload) {

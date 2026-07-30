@@ -1,4 +1,4 @@
-# .NET build intermediates — cs/bin/bootsharp/ (the deployable ES module)
+# .NET build intermediates - cs/bin/bootsharp/ (the deployable ES module)
 # is intentionally committed so colleagues can run this without the SDK.
 cs/obj/
 cs/bin/Debug/
