@@ -4,6 +4,13 @@
 // at construction - since each one carries a fair amount of memory (its own
 // .NET runtime + business logic library). The pool only ever grows up to
 // maxWorkers; jobs beyond that queue until a worker frees up.
+//
+// A running job may stop part-way to ask the UI a question. The worker sits
+// blocked (state 'waiting') until someone calls answer() or cancel() on the
+// request emitted with the 'ask' event. A waiting worker still holds its slot
+// and its memory - it just isn't burning CPU.
+
+import { writeAnswer, cancelAnswer } from './answer-slot.js';
 
 export class WorkerPool {
     // memoryBudgetBytes: soft cap on total self-reported worker memory - a new
@@ -18,7 +25,7 @@ export class WorkerPool {
         this.memoryBudgetBytes = memoryBudgetBytes;
         this.workerMemoryLimitBytes = workerMemoryLimitBytes;
         this.workerUrl = workerUrl;
-        this.workers = [];      // spawned so far: { id, worker, state, currentJob, memBytes }
+        this.workers = [];      // spawned so far: { id, worker, state, currentJob, memBytes, slot, pendingAsk }
         this.queue = [];        // pending jobs waiting for a free (or new) worker
         this.jobCounter = 0;
         this.listeners = {};
@@ -28,10 +35,11 @@ export class WorkerPool {
         (this.listeners[event] ??= []).push(cb);
     }
 
-    // Submit a job; resolves with { text, elapsed } once some worker runs it.
-    run(duration) {
+    // Submit a job; resolves with { text, elapsed } once some worker runs it,
+    // or rejects if one of its `askCount` questions is cancelled.
+    run(duration, askCount = 0) {
         return new Promise((resolve, reject) => {
-            const job = { id: ++this.jobCounter, duration, resolve, reject, queuedAt: performance.now() };
+            const job = { id: ++this.jobCounter, duration, askCount, resolve, reject, queuedAt: performance.now() };
             this.queue.push(job);
             this._emit('queuechange', this.queue.length);
             this._dispatch();
@@ -47,7 +55,7 @@ export class WorkerPool {
     // recover from an error without changing the pool's size).
     _spawn(id = this.workers.length) {
         const worker = new Worker(this.workerUrl, { type: 'module' });
-        const entry = { id, worker, state: 'booting', currentJob: null, memBytes: 0 };
+        const entry = { id, worker, state: 'booting', currentJob: null, memBytes: 0, slot: null, pendingAsk: null };
         this.workers[id] = entry;
 
         worker.onmessage = ({ data }) => this._handleMessage(entry, data);
@@ -59,16 +67,39 @@ export class WorkerPool {
     _handleMessage(entry, data) {
         if (data.type === 'ready') {
             entry.state = 'idle';
+            entry.slot = data.slot;
             entry.memBytes = data.memBytes ?? entry.memBytes;
             this._emit('statechange', entry);
             this._dispatch();
 
-        } else if (data.type === 'done') {
+        } else if (data.type === 'progress') {
+            this._emit('progress', { entry, job: entry.currentJob, percent: data.percent });
+
+        } else if (data.type === 'ask') {
+            const request = {
+                entry,
+                job: entry.currentJob,
+                prompt: data.prompt,
+                outcome: null, // 'answered' | 'cancelled' | 'workerlost', once settled
+                answer: (text) => this._settleAsk(request, 'answered', () => writeAnswer(entry.slot, String(text))),
+                cancel: () => this._settleAsk(request, 'cancelled', () => cancelAnswer(entry.slot)),
+            };
+            entry.pendingAsk = request;
+            entry.state = 'waiting';
+            this._emit('statechange', entry);
+            this._emit('ask', request);
+
+        } else if (data.type === 'done' || data.type === 'failed') {
             const job = entry.currentJob;
             entry.currentJob = null;
             entry.memBytes = data.memBytes ?? entry.memBytes;
-            this._emit('jobdone', { entry, job, text: data.text, elapsed: data.elapsed });
-            job.resolve({ text: data.text, elapsed: data.elapsed });
+            if (data.type === 'done') {
+                this._emit('jobdone', { entry, job, text: data.text, elapsed: data.elapsed });
+                job.resolve({ text: data.text, elapsed: data.elapsed });
+            } else {
+                this._emit('jobfailed', { entry, job, message: data.message, elapsed: data.elapsed });
+                job.reject(new Error(data.message));
+            }
 
             if (entry.memBytes > this.workerMemoryLimitBytes) {
                 // Over budget - WASM memory only grows, so the only way to
@@ -85,9 +116,29 @@ export class WorkerPool {
         }
     }
 
+    // Answers/cancels at most once, and only while the worker is still the
+    // one that asked - a respawned worker in the same slot has a fresh slot
+    // buffer and isn't waiting on anything.
+    _settleAsk(request, outcome, write) {
+        const { entry } = request;
+        if (entry.pendingAsk !== request) return;
+        entry.pendingAsk = null;
+        request.outcome = outcome;
+        write();
+        entry.state = 'busy';
+        this._emit('askclosed', request);
+        this._emit('statechange', entry);
+    }
+
     _handleError(entry, err) {
         const job = entry.currentJob;
         entry.currentJob = null;
+        if (entry.pendingAsk) {
+            const request = entry.pendingAsk;
+            entry.pendingAsk = null;
+            request.outcome = 'workerlost';
+            this._emit('askclosed', request);
+        }
         entry.worker.terminate();
         this._emit('error', { entry, err });
 
@@ -117,7 +168,7 @@ export class WorkerPool {
             this._emit('jobstart', { entry: free, job });
             this._emit('statechange', free);
 
-            free.worker.postMessage({ duration: job.duration });
+            free.worker.postMessage({ jobId: job.id, duration: job.duration, askCount: job.askCount });
         }
 
         // Backlog remains after using every idle worker. Workers still

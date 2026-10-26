@@ -5,7 +5,7 @@ const importedById = new Map();
 const idByImported = new Map();
 const onDisposeById = new Map();
 const idPool = new Array();
-let nextId = 1; // JS IDs are positive; C#'s - negative; 0 reserved for null.
+let nextId = 1; // JS IDs are positive; C#'s — negative; 0 reserved for null.
 export const instances = {
     /** Resolves a registered instance associated with the specified ID,
      *  or uses the specified factory to register a new exported instance. */

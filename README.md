@@ -36,10 +36,10 @@ running blocking WASM calls.
 ```
 cs/
   WasmDemo.csproj     .NET 10 browser-wasm project, Bootsharp package
-  Program.cs          [Export] BusyWait(int durationMs) - the C# method
+  Program.cs          [Export] RunJob(...) + sync [Import] AskUser/ReportProgress
   bin/bootsharp/       Bootsharp-generated ES module (build output, see below)
 worker.js              ES module Web Worker: boots Bootsharp once, then serves
-                        one BusyWait job per incoming message, indefinitely
+                        one RunJob per incoming message; implements AskUser
 pool.js                WorkerPool: spawns N worker.js instances, tracks their
                         state, queues/dispatches jobs, emits UI events
 index.html             UI: 4 worker-status cards, batch controls, log, heartbeat
@@ -51,20 +51,47 @@ index.html             UI: 4 worker-status cards, batch controls, log, heartbeat
 
 ```csharp
 [Export]
-public static string BusyWait(int durationMs) { ... }
+public static string RunJob(int jobId, int durationMs, int askCount) { ... }
 ```
 
 `dotnet publish` compiles this to WASM and Bootsharp generates an ES module
 at `cs/bin/bootsharp/index.mjs` that exports a `Program` object with a
-`busyWait(durationMs)` JS function mirroring the C# method 1:1. All WASM and
+`runJob(jobId, durationMs, askCount)` JS function mirroring the C# method 1:1. All WASM and
 assembly binaries are embedded as base64 inside the generated JS - there are
 no extra `.wasm` files to serve or fetch.
 
-Calling `Program.busyWait(ms)` from JS is **synchronous**: it blocks
-whichever thread calls it for the duration of the C# method. Nothing about
-this uses `SharedArrayBuffer`, shared WASM linear memory, COOP/COEP headers,
-or .NET's experimental `browser-mt` threading - it's one WASM instance
-running on one thread, called like a normal (blocking) function.
+Calling `Program.runJob(...)` from JS is **synchronous**: it blocks
+whichever thread calls it for the duration of the C# method. It doesn't use
+shared WASM linear memory or .NET's experimental `browser-mt` threading -
+it's one WASM instance running on one thread, called like a normal
+(blocking) function.
+
+### 1b. C# asking the UI for input, synchronously
+
+Part-way through `RunJob`, C# calls `[Import] AskUser(jobId, prompt)` - a
+**synchronous** call into JS that must return the user's answer. The
+worker is blocked inside C#, so its `onmessage` can't run and a
+`postMessage` reply would never be seen. Instead:
+
+```
+worker (inside C#)                       main thread
+askUser(): state = PENDING
+           postMessage({type:'ask'}) ──► shows prompt
+           Atomics.wait(state)            user types…
+           (thread asleep, 0% CPU)        write answer into SharedArrayBuffer
+                                          state = ANSWERED; Atomics.notify
+           ◄── wakes, reads answer, returns string to C#
+```
+
+This works for any number of questions per job, and questions from several
+workers queue in the UI and can be answered in any order. Cancelling a
+question makes `AskUser` throw into C#, which fails that job but leaves the
+worker reusable.
+
+`SharedArrayBuffer` requires the page to be **cross-origin isolated**, so
+`serve.json` sends `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. In a real app, check that
+every third-party script, iframe and asset still loads under COEP.
 
 ### 2. One WASM instance per worker - `worker.js`
 
@@ -78,7 +105,7 @@ running on one thread, called like a normal (blocking) function.
 2. Posts `{ type: 'ready' }` back once boot resolves.
 3. From then on, `self.onmessage` stays bound for the worker's whole
    lifetime: each `{ duration }` message triggers one synchronous
-   `Program.busyWait(duration)` call, posting `{ type: 'started' }` before
+   `Program.runJob(...)` call, posting `{ type: 'started' }` before
    and `{ type: 'done', text, elapsed }` after. Because the handler is never
    torn down, the same worker (and its already-booted runtime) can serve any
    number of jobs one after another - this is what makes it reusable as a

@@ -12,10 +12,20 @@ that avoids over-spawning workers.
   no framework.
 - `pool.js` — `WorkerPool` class. All the interesting logic lives here.
 - `worker.js` — the module worker entry point. Boots Bootsharp once, then
-  handles one `{ duration }` message per job by calling `Program.busyWait`.
-- `cs/Program.cs`, `cs/WasmDemo.csproj` — the actual C# "business logic"
-  (currently just `BusyWait`). Target is `net10.0` / `browser-wasm` via the
-  `Bootsharp` NuGet package.
+  handles one `{ jobId, duration, askCount }` message per job by calling
+  `Program.runJob`. Also implements the C# → JS imports `askUser` (blocks
+  on `Atomics.wait`) and `reportProgress`.
+- `answer-slot.js` — layout + read/write helpers for the per-worker
+  `SharedArrayBuffer` that carries a user's answer back into a blocked
+  worker. Shared by `worker.js` and `pool.js`.
+- `serve.json` — COOP/COEP headers for `serve`. Required: without
+  cross-origin isolation `SharedArrayBuffer` doesn't exist and the UI
+  disables "Run batch".
+- `cs/Program.cs`, `cs/WasmDemo.csproj` — the actual C# "business logic":
+  `[Export] RunJob(jobId, durationMs, askCount)` plus sync
+  `[Import] AskUser` / `ReportProgress`. Target is `net10.0` /
+  `browser-wasm` via the `Bootsharp` NuGet package. Rebuilding needs the
+  .NET 10 `wasm-tools` workload (`cd cs && dotnet publish -c Debug`).
 - `cs/bin/bootsharp/**` — **generated output** from the Bootsharp build
   (dotnet runtime, JS interop glue, `index.mjs`, `runtime.mjs`, etc.). Don't
   hand-edit; it gets regenerated. `runtime.mjs`'s `getHeap()` is a
@@ -76,10 +86,39 @@ MB**. Useful for picking test figures for the memory-budget/recycle inputs,
 but re-measure rather than trust this if the C# lib, Bootsharp version, or
 target framework changes.
 
+## Synchronous C# → UI questions (askUser)
+
+C# calls `AskUser` synchronously mid-job. The worker's event loop is frozen
+for the whole `runJob` call, so **the answer can never arrive by
+`postMessage`** — `onmessage` wouldn't run until C# returned, which it
+can't without the answer. Instead:
+
+1. Worker sets the slot's state word to `PENDING`, posts `{ type: 'ask' }`,
+   then `Atomics.wait`s on that word.
+2. Pool marks the worker `waiting` and emits `'ask'` with a request object
+   carrying `answer(text)` / `cancel()`.
+3. `answer` writes UTF-8 into the slot, flips state to `ANSWERED`,
+   `Atomics.notify`s. `cancel` flips to `CANCELLED`, which makes `askUser`
+   throw → exception unwinds through C# → worker posts `'failed'` → job
+   rejects, worker goes back to idle (runtime is still healthy).
+
+Gotchas found while building it:
+- `TextEncoder.encodeInto` and `TextDecoder.decode` **refuse views over
+  shared memory** in Chromium — copy through an ordinary buffer.
+- `postMessage` *out* of a blocked worker works fine (it only enqueues);
+  that's how `reportProgress` streams progress during a C# call.
+- A `waiting` worker holds its pool slot and memory but no CPU. It's not
+  `idle`, so `_dispatch()` correctly won't hand it work or count it as
+  spare capacity.
+
 ## UI (index.html) reference
 
-Inputs: `#jobCount`, `#minDur`, `#maxDur`, `#maxWorkers`, `#memBudget` (MB,
-blank = off), `#workerMemLimit` (MB, blank = off). Button: `#runBtn`.
+Inputs: `#jobCount`, `#minDur`, `#maxDur`, `#minAsks`, `#maxAsks`
+(questions per job), `#maxWorkers`, `#memBudget` (MB, blank = off),
+`#workerMemLimit` (MB, blank = off). Button: `#runBtn`. Pending questions
+render as `form.prompt` in `#prompts` (text `input`, submit button,
+`.cancel` button); `#promptsHead` shows the count. Badge states include
+`waiting`.
 Stats: `#spawnStat` ("spawned: X / cap"), `#queueStat`, `#doneStat`,
 `#wallStat`. Worker cards (`.worker-card`, one per **spawned** worker —
 they appear lazily, not pre-rendered) each have `.badge` (state),

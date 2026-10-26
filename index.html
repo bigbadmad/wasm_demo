@@ -15,6 +15,7 @@
     --ok: #4fd18b;
     --busy: #f5a623;
     --err: #f0555e;
+    --wait: #c58cff;
   }
   * { box-sizing: border-box; }
   body {
@@ -111,6 +112,7 @@
   .badge.state-idle { background: var(--ok); }
   .badge.state-busy { background: var(--busy); }
   .badge.state-error { background: var(--err); }
+  .badge.state-waiting { background: var(--wait); }
   .worker-card .job-info {
     font-size: 12px;
     color: var(--muted);
@@ -135,6 +137,34 @@
     background: var(--busy);
   }
   .bar .fill.done { background: var(--ok); }
+  .bar .fill.waiting { background: var(--wait); }
+  .bar .fill.failed { background: var(--err); }
+
+  .prompts-head { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .prompts-head.has { color: var(--wait); font-weight: 600; }
+  .prompts { display: flex; flex-direction: column; gap: 8px; }
+  .prompt {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    background: #0d0f14;
+    border: 1px solid var(--wait);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .prompt .who { font-size: 12px; color: var(--muted); min-width: 140px; }
+  .prompt .q { font-size: 14px; flex: 1; min-width: 160px; }
+  .prompt input {
+    background: #05070a;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 14px;
+    width: 180px;
+  }
+  .prompt button.cancel { background: transparent; color: var(--muted); border: 1px solid var(--border); }
 
   .log {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -151,6 +181,7 @@
   .tag { color: var(--muted); }
   .tag.main { color: var(--accent); }
   .tag.pool { color: var(--ok); }
+  .tag.ask { color: var(--wait); }
 </style>
 </head>
 <body>
@@ -165,9 +196,20 @@
     stops new workers from spawning once the pool is likely to blow it, and a
     per-worker recycle limit terminates and reboots any worker whose
     self-reported WASM heap creeps past it (WASM linear memory only grows, so
-    that's the only way to reclaim it). Every job is a synchronous
-    <code>BusyWait(ms)</code> call inside its worker - the main thread stays
-    responsive throughout, as shown by the heartbeat below.
+    that's the only way to reclaim it). Every job is one synchronous
+    <code>RunJob(...)</code> call into C# inside its worker - the main thread
+    stays responsive throughout, as shown by the heartbeat below.
+  </p>
+  <p class="sub">
+    Part-way through, C# may need something only the user can supply. It
+    calls a <em>synchronous</em> JS import, <code>AskUser(prompt)</code>, any
+    number of times per job. The worker can't receive a <code>postMessage</code>
+    while it's stuck inside C#, so it parks on <code>Atomics.wait</code> over a
+    <code>SharedArrayBuffer</code>; the UI writes the answer into that shared
+    memory and wakes it with <code>Atomics.notify</code>. Questions from
+    different workers queue up below and can be answered in any order.
+    Requires cross-origin isolation (COOP/COEP headers, see
+    <code>serve.json</code>).
   </p>
 
   <div class="panel">
@@ -180,6 +222,10 @@
       <input id="maxDur" type="number" value="3000" min="0" step="100">
       <label for="maxWorkers">Max workers</label>
       <input id="maxWorkers" type="number" value="4" min="1" max="8">
+      <label for="minAsks">Min questions</label>
+      <input id="minAsks" type="number" value="0" min="0" max="4">
+      <label for="maxAsks">Max questions</label>
+      <input id="maxAsks" type="number" value="2" min="0" max="4">
       <label for="memBudget">Mem budget (MB)</label>
       <input id="memBudget" type="number" value="" min="0" step="10" placeholder="off">
       <label for="workerMemLimit">Worker recycle limit (MB)</label>
@@ -199,6 +245,11 @@
   </div>
 
   <div class="panel">
+    <div class="prompts-head" id="promptsHead">input requests: none waiting</div>
+    <div class="prompts" id="prompts"></div>
+  </div>
+
+  <div class="panel">
     <div class="workers" id="workers"></div>
   </div>
 
@@ -209,6 +260,10 @@
 
 <script type="module">
 import { WorkerPool } from '/pool.js';
+
+// SharedArrayBuffer only exists on a cross-origin isolated page. Without it
+// the workers can boot but can never receive an answer, so say so up front.
+const isolated = self.crossOriginIsolated && typeof SharedArrayBuffer === 'function';
 
 let ticks = 0;
 const tickEl = document.getElementById('tick');
@@ -234,6 +289,10 @@ const cards = new Map(); // id -> { card, badge, jobInfo, mem, fill }
 function mbToBytes(input) {
   const mb = Number(input.value);
   return mb > 0 ? mb * 1024 * 1024 : Infinity;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }
 
 function fmtMB(bytes) {
@@ -281,31 +340,90 @@ pool.on('statechange', (entry) => {
   c.badge.className = `badge state-${entry.state}`;
   c.badge.textContent = entry.state;
   c.mem.textContent = `mem: ${fmtMB(entry.memBytes)}`;
+  c.fill.classList.toggle('waiting', entry.state === 'waiting');
   if (entry.state === 'idle') {
     c.jobInfo.textContent = '-';
-    c.fill.classList.remove('done');
-    c.fill.style.transition = 'none';
+    c.fill.classList.remove('done', 'failed');
     c.fill.style.width = '0%';
+  }
+});
+
+// Progress comes from C# itself (ReportProgress), so the bar honestly stalls
+// while the worker is parked waiting on the user.
+pool.on('progress', ({ entry, percent }) => {
+  cards.get(entry.id).fill.style.width = `${percent}%`;
+});
+
+const promptsEl = document.getElementById('prompts');
+const promptsHead = document.getElementById('promptsHead');
+const promptEls = new Map(); // request -> element
+
+function updatePromptsHead() {
+  const n = promptEls.size;
+  promptsHead.textContent = n ? `input requests: ${n} waiting - each one has a worker thread blocked on it` : 'input requests: none waiting';
+  promptsHead.classList.toggle('has', n > 0);
+}
+
+pool.on('ask', (request) => {
+  const { entry, job, prompt } = request;
+  const el = document.createElement('form');
+  el.className = 'prompt';
+  el.innerHTML = `
+    <span class="who">worker #${entry.id} - job #${job.id}</span>
+    <span class="q">${escapeHtml(prompt)}</span>
+    <input type="text" autocomplete="off" aria-label="Answer">
+    <button type="submit">Answer</button>
+    <button type="button" class="cancel">Cancel job</button>
+  `;
+  const input = el.querySelector('input');
+  el.addEventListener('submit', (e) => { e.preventDefault(); request.answer(input.value); });
+  el.querySelector('.cancel').addEventListener('click', () => request.cancel());
+  promptsEl.appendChild(el);
+  promptEls.set(request, el);
+  updatePromptsHead();
+  // Only steal focus when nothing else is mid-answer.
+  if (!promptsEl.contains(document.activeElement)) input.focus();
+
+  cards.get(entry.id).jobInfo.textContent = `job #${job.id} - waiting for input`;
+  log('ask', `worker #${entry.id} (job #${job.id}) blocked in C#, asking: "${escapeHtml(prompt)}"`);
+});
+
+pool.on('askclosed', (request) => {
+  const el = promptEls.get(request);
+  const value = el?.querySelector('input').value;
+  el?.remove();
+  promptEls.delete(request);
+  updatePromptsHead();
+  // Hand focus to the next question, if any.
+  if (!promptsEl.contains(document.activeElement)) promptsEl.querySelector('input')?.focus();
+
+  const { entry, job, outcome } = request;
+  if (outcome === 'answered') {
+    cards.get(entry.id).jobInfo.textContent = `job #${job.id} - runJob(${job.duration} ms)`;
+    log('ask', `worker #${entry.id} (job #${job.id}) woken with answer "${escapeHtml(value)}", back in C#`);
+  } else if (outcome === 'cancelled') {
+    log('ask', `worker #${entry.id} (job #${job.id}) woken with a cancellation - AskUser throws into C#`);
   }
 });
 
 pool.on('jobstart', ({ entry, job }) => {
   const c = cards.get(entry.id);
-  c.jobInfo.textContent = `job #${job.id} - busyWait(${job.duration} ms)`;
-  c.fill.classList.remove('done');
-  c.fill.style.transition = 'none';
+  c.jobInfo.textContent = `job #${job.id} - runJob(${job.duration} ms)`;
+  c.fill.classList.remove('done', 'failed');
   c.fill.style.width = '0%';
-  // Force reflow so the width:0 takes effect before animating to 100%.
-  void c.fill.offsetWidth;
-  c.fill.style.transition = `width ${job.duration}ms linear`;
-  c.fill.style.width = '100%';
-  log('pool', `worker #${entry.id} picked up job #${job.id} (${job.duration} ms)`);
+  log('pool', `worker #${entry.id} picked up job #${job.id} (${job.duration} ms, ${job.askCount} question${job.askCount === 1 ? '' : 's'})`);
 });
 
 pool.on('jobdone', ({ entry, job, text, elapsed }) => {
   const c = cards.get(entry.id);
   c.fill.classList.add('done');
-  log('pool', `worker #${entry.id} finished job #${job.id} after ${elapsed} ms - "${text}"`);
+  log('pool', `worker #${entry.id} finished job #${job.id} after ${elapsed} ms - ${escapeHtml(text)}`);
+});
+
+pool.on('jobfailed', ({ entry, job, message, elapsed }) => {
+  const c = cards.get(entry.id);
+  c.fill.classList.add('failed');
+  log('pool', `worker #${entry.id} job #${job.id} failed after ${elapsed} ms - ${escapeHtml(message.split('\n')[0])}`);
 });
 
 pool.on('queuechange', (depth) => {
@@ -325,6 +443,8 @@ runBtn.addEventListener('click', async () => {
   const jobCount = Math.max(1, Number(document.getElementById('jobCount').value) || 1);
   const minDur = Math.max(0, Number(document.getElementById('minDur').value) || 0);
   const maxDur = Math.max(minDur, Number(document.getElementById('maxDur').value) || minDur);
+  const minAsks = Math.max(0, Number(document.getElementById('minAsks').value) || 0);
+  const maxAsks = Math.max(minAsks, Number(document.getElementById('maxAsks').value) || minAsks);
   pool.maxWorkers = Math.max(1, Number(maxWorkersInput.value) || 1);
   pool.memoryBudgetBytes = mbToBytes(memBudgetInput);
   pool.workerMemoryLimitBytes = mbToBytes(workerMemLimitInput);
@@ -339,27 +459,43 @@ runBtn.addEventListener('click', async () => {
   const durations = Array.from({ length: jobCount }, () =>
     Math.round(minDur + Math.random() * (maxDur - minDur)));
 
-  log('main', `submitting ${jobCount} jobs to the pool (durations ${minDur}-${maxDur} ms), max ${pool.maxWorkers} workers`);
+  const askCounts = durations.map(() => minAsks + Math.floor(Math.random() * (maxAsks - minAsks + 1)));
+
+  log('main', `submitting ${jobCount} jobs to the pool (durations ${minDur}-${maxDur} ms, ${minAsks}-${maxAsks} questions each), max ${pool.maxWorkers} workers`);
   const wallStart = performance.now();
   let completed = 0;
+  let failed = 0;
 
-  const results = await Promise.all(durations.map(async (duration) => {
-    const result = await pool.run(duration);
+  await Promise.all(durations.map(async (duration, i) => {
+    try {
+      await pool.run(duration, askCounts[i]);
+    } catch {
+      failed++;
+    }
     completed++;
-    doneStat.textContent = `completed: ${completed} / ${jobCount}`;
-    return result;
+    doneStat.textContent = `completed: ${completed} / ${jobCount}${failed ? ` (${failed} cancelled)` : ''}`;
   }));
 
   const wallElapsed = performance.now() - wallStart;
   const sequentialEstimate = durations.reduce((a, b) => a + b, 0);
   const speedup = (sequentialEstimate / wallElapsed).toFixed(2);
-  wallStat.textContent = `wall clock: ${wallElapsed.toFixed(0)} ms (sequential would be ~${sequentialEstimate} ms, ${speedup}x speedup)`;
+  // Once a human is in the loop, wall clock is mostly their think time, so a
+  // compute-only speedup figure would be meaningless.
+  const asked = askCounts.some(n => n > 0);
+  wallStat.textContent = asked
+    ? `wall clock: ${wallElapsed.toFixed(0)} ms (includes time waiting for answers; compute alone ~${sequentialEstimate} ms sequential)`
+    : `wall clock: ${wallElapsed.toFixed(0)} ms (sequential would be ~${sequentialEstimate} ms, ${speedup}x speedup)`;
 
-  log('main', `batch complete - ${results.length} jobs in ${wallElapsed.toFixed(0)} ms (${speedup}x vs sequential)`);
+  log('main', `batch complete - ${jobCount} jobs (${failed} cancelled) in ${wallElapsed.toFixed(0)} ms${asked ? '' : ` (${speedup}x vs sequential)`}`);
   runBtn.disabled = false;
 });
 
-log('main', `pool ready - no workers spawned yet, click "Run batch" to start (cap: ${pool.maxWorkers})`);
+if (isolated) {
+  log('main', `pool ready - no workers spawned yet, click "Run batch" to start (cap: ${pool.maxWorkers})`);
+} else {
+  runBtn.disabled = true;
+  log('main', 'page is NOT cross-origin isolated, so SharedArrayBuffer is unavailable and workers could never be answered. Serve with the COOP/COEP headers in serve.json (npm start does this).');
+}
 </script>
 </body>
 </html>
